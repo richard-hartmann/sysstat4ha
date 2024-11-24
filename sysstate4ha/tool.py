@@ -9,8 +9,44 @@ import socket
 import datetime as dt
 import tomllib
 import os
+from dataclasses import dataclass
+from typing import Callable
+from functools import partial
+import yaml
+import re
 
 log = logging.getLogger(__name__)
+
+
+class CPUUsage:
+    """use psutil to get CPU usage
+
+    key feature: getter returns a function with no arguments that returns the cpu usage for
+    a single core (what is an integer) or the average (what is 'all'). Since psutil's
+    cpu_percent yields average values with respect to the last call, values are cached until
+    an already fetched quantity is fetched again.
+    """
+
+    def __init__(self):
+        self.update()
+
+    def get(self, what):
+        if what in self.fetched:
+            self.update()
+        self.fetched.add(what)
+        if what == "all":
+            return self.cpu_usage_avrg
+        else:
+            return self.cpu_usage[what]
+
+    def getter(self, what):
+        return partial(self.get, what=what)
+
+    def update(self):
+        self.fetched = set()
+        self.cpu_usage = psutil.cpu_percent(percpu=True)
+        self.cpu_usage_avrg = int(10*sum(self.cpu_usage) / len(self.cpu_usage)) / 10
+        log.debug("new cpu_percent data cached")
 
 
 def get_machiene_id(len_id=6):
@@ -53,6 +89,33 @@ def get_uptime():
     RuntimeError("Failed to get uptime")
 
 
+class Entity:
+    """abstraction layer for entities to generalize"""
+
+    def __init__(
+        self,
+        name: str,
+        mid: str,
+        unit_of_measurement: str,
+        get: Callable,
+        yaml_keys: dict = {},
+        full_name: str | None = None,
+        card_name: str | None = None,
+    ):
+        self.name = name
+        self.mid = mid
+        self.unit_of_measurement = unit_of_measurement
+        self.get = get
+        self.yaml_keys = yaml_keys
+        self.full_name = full_name
+        self.card_name = name if card_name is None else card_name
+
+        self.qual_name = self.name.replace(" ", "_").replace("/", "_").lower()
+        self.state_topic = f"{self.mid}/{self.qual_name}"
+        self.unique_id = f"{self.mid}_{self.qual_name}"
+        
+
+
 class SysState4HA:
     def __init__(
         self,
@@ -80,41 +143,78 @@ class SysState4HA:
             f"mosquitto_pub -h {self.host} -r -u {self.user} -P {self.passowrd}"
         )
 
+        self.cpu_usage = CPUUsage()
+
+        self.entities: list[Entity] = []
+        # overall CPU usage
+        self.entities.append(
+            Entity(
+                name="CPU all",
+                mid=self.mid,
+                unit_of_measurement="%",
+                get=self.cpu_usage.getter("all"),
+                yaml_keys={
+                    "type": "custom:bar-card",
+                    "entity_row": "true",
+                    "icon": "mdi:chip",
+                },
+            )
+        )
+        # individual cores
+        for i in range(1, psutil.cpu_count() + 1):
+            self.entities.append(
+                Entity(
+                    name=f"CPU {i}",
+                    mid=self.mid,
+                    unit_of_measurement="%",
+                    get=self.cpu_usage.getter(i - 1),
+                    yaml_keys={
+                        "type": "custom:bar-card",
+                        "entity_row": "true",
+                        "icon": "mdi:chip",
+                    },
+                )
+            )
+        # disk usage
+        for dp in self.disk_parts:
+            self.entities.append(
+                Entity(
+                    # used to construct the state_topic and sensor id
+                    name=dp.device,
+                    # this will be shown in the generated card YAML
+                    card_name = dp.mountpoint,
+                    # extra info, not used yet
+                    full_name=f"{dp.device}: {dp.mountpoint} ({dp.fstype})",
+                    mid=self.mid,
+                    unit_of_measurement="%",
+                    get=partial(
+                        lambda x: psutil.disk_usage(x).percent, x=dp.mountpoint
+                    ),
+                    yaml_keys={
+                        "type": "custom:bar-card",
+                        "entity_row": "true",
+                        "icon": "mdi:harddisk",
+                    },
+                )
+            )
+        # uptime
+        self.entities.append(
+            Entity(
+                name="uptime", mid=self.mid, unit_of_measurement=None, get=get_uptime,
+                yaml_keys={'icon': 'mdi:timelapse'}
+            )
+        )
+
     def _generate_discovery_JSON(self):
         cmps = {}
-        for i in range(1, self.ncpu + 1):
-            cmps[f"cpu{i}"] = {
-                "name": f"CPU{i}",
+        for e in self.entities:
+            cmps[e.name] = {
+                "name": e.name,
                 "platform": "sensor",
-                "state_topic": f"{self.mid}/cpu{i}",
-                "unique_id": f"{self.mid}_cpu{i}",
-                "unit_of_measurement": "%",
+                "state_topic": e.state_topic,
+                "unique_id": e.unique_id,
+                "unit_of_measurement": e.unit_of_measurement,
             }
-
-        cmps[f"cpu_all"] = {
-            "name": f"CPU all",
-            "platform": "sensor",
-            "state_topic": f"{self.mid}/cpu_all",
-            "unique_id": f"cpu_all_{self.mid}",
-            "unit_of_measurement": "%",
-        }
-
-        for dp in self.disk_parts:
-            dev = dp.device.replace("/", "_")[1:]
-            cmps[dev] = {
-                "name": f"{dp.device} {dp.mountpoint} {dp.fstype}",
-                "platform": "sensor",
-                "state_topic": f"{self.mid}/{dev}",
-                "unique_id": f"{self.mid}_{dev}",
-                "unit_of_measurement": "%",
-            }
-
-        cmps["uptime"] = {
-            "name": "uptime",
-            "platform": "sensor",
-            "state_topic": f"{self.mid}/uptime",
-            "unique_id": f"{self.mid}_uptime",
-        }
 
         data = {
             "origin": {"name": self.origin_name},
@@ -127,6 +227,10 @@ class SysState4HA:
         }
 
         return json.dumps(data, sort_keys=True, indent=4)
+
+    #####################################
+    ## commands
+    #####################################
 
     def expose(self, **kwargs):
         js = self._generate_discovery_JSON().replace('"', r"\"")
@@ -154,19 +258,11 @@ class SysState4HA:
         try:
             while True:
                 t0 = time.perf_counter()
-                self._pub(psutil.cpu_percent(), f"{self.mid}/cpu_all")
-                p = psutil.cpu_percent(percpu=True)
-                for i in range(1, self.ncpu + 1):
-                    self._pub(p[i - 1], f"{self.mid}/cpu{i}")
-                for dp in self.disk_parts:
-                    dev = dp.device.replace("/", "_")[1:]
-                    self._pub(
-                        psutil.disk_usage(dp.mountpoint).percent, f"{self.mid}/{dev}"
-                    )
-                self._pub(get_uptime(), f"{self.mid}/uptime")
+                for e in self.entities:
+                    self._pub(e.get(), e.state_topic)
 
                 t1 = time.perf_counter()
-                time.sleep(self.interval - (t1 - t0))
+                time.sleep(s if (s := self.interval - (t1 - t0)) > 0 else 0)
         except KeyboardInterrupt:
             pass
 
@@ -220,8 +316,30 @@ systemctl start s4h.service
             f.write(install_script)
 
         p_install.chmod(0o755)
-
         print(f"call 'sudo {p_install}' to install publishing as systemd service")
+
+        entities_list = []
+        for e in self.entities:
+            entity_qual_name = f"sensor.{self.host_alias}_{e.qual_name}"
+            # reduce multiple '_' to only one
+            entity_qual_name = re.sub(r'_+', '_', entity_qual_name)
+            # remove trailing '_'
+            entity_qual_name = re.sub(r'_$', '', entity_qual_name)
+
+            entities_list.append(
+                {
+                    "entity": entity_qual_name,
+                    "name": e.card_name,
+                    **e.yaml_keys,
+                }
+            )
+
+        card_dict = {"type": "entities", "entities": entities_list}
+        p_card_yaml = p / "card.yaml"
+        with open(p_card_yaml, 'w') as f:
+            yaml.dump(card_dict, f)
+
+        print(f"check out {p_card_yaml} for a card proposal (needs 'custom:bar-card' from HACS)")
 
 
 def cli():
@@ -233,7 +351,7 @@ def cli():
     parser.add_argument(
         "cmd",
         help="what to do",
-        choices=["expose", "remove", "publish", "prepare_install"],
+        choices=["expose", "remove", "publish", "prepare_install", "test"],
     )
     parser.add_argument("-c", "--conf", help="path to config toml", required=True)
     parser.add_argument(

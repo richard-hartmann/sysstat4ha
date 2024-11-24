@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "sysstate4ha"
-version = "0.1.0"
+version = "1.0.0"
 description = "Expose system state, e.g., CPU load, uptime etc. to home assistant using mqtt (demonstrator project)"
 authors = ["Richard Hartmann <richard_hartmann@gmx.de>"]
 license = "MIT"
@@ -14,6 +14,7 @@ s4h = 'sysstate4ha.tool:cli'
 python = "^3.11"
 psutil = "^6.1.0"
 black = "^24.10.0"
+pyyaml = "^6.0.2"
 
 
 [build-system]
