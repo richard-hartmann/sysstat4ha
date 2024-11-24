@@ -1,0 +1,11 @@
+[SysState4HA]
+# adjust to your needs
+ha_host = "<hostname_of_home_assistant>"
+mqtt_user = "<your_mqtt_user>"
+mqtt_password = "<password_mqtt_user>"
+
+# considere the following as defaults
+update_interval = 2
+host_alias = ""  # will use hostname
+origin_name = "linux mosquitto"
+len_id = 6
