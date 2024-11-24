@@ -246,7 +246,7 @@ class SysState4HA:
         log.info(f"remove device/{self.mid} successful")
 
     def _pub(self, value, topic):
-        cmd = f"{self.base_cmd} -t {topic} -m {value}"
+        cmd = f"{self.base_cmd} -t {topic} -m \"{value}\""
         log.debug(f"run cmd: {cmd}")
         r = subprocess.run(cmd, shell=True, capture_output=False)
         if r.returncode == 0:
